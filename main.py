@@ -15,24 +15,48 @@ def resize_to_width(img, target_w=1080):
     return cv2.resize(img, (target_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-def find_white_bands(gray, x1, x2, white_thr=245, min_run=18):
+def detect_theme(gray, w, h):
     """
-    Повертає список білих горизонтальних смуг (start_y, end_y exclusive).
-    Білою вважаємо смугу, де середня яскравість рядка >= white_thr
-    протягом min_run рядків.
+    Просте визначення теми: дивимось медіану яскравості в центральній зоні зверху.
     """
-    row_mean = gray[:, x1:x2].mean(axis=1)
-    is_white = row_mean >= white_thr
+    x1 = int(0.20 * w)
+    x2 = int(0.80 * w)
+    y1 = int(0.12 * h)
+    y2 = int(0.28 * h)
+    roi = gray[y1:y2, x1:x2]
+    med = float(np.median(roi)) if roi.size else float(np.median(gray))
+    return "light" if med >= 150.0 else "dark"
+
+
+def find_bg_bands(
+    gray, x1, x2, theme,
+    min_run=24,
+    white_thr=235, white_frac=0.985,
+    black_thr=30, black_frac=0.985
+):
+    """
+    Повертає список фонових горизонтальних смуг (start_y, end_y exclusive).
+    Для light: фон = майже білий (частка пікселів >= white_thr).
+    Для dark:  фон = майже чорний (частка пікселів <= black_thr).
+    """
+    roi = gray[:, x1:x2]
+
+    if theme == "light":
+        frac = (roi >= white_thr).mean(axis=1)  # частка "дуже світлих" пікселів у рядку
+        is_bg = frac >= white_frac
+    else:
+        frac = (roi <= black_thr).mean(axis=1)  # частка "дуже темних" пікселів у рядку
+        is_bg = frac >= black_frac
 
     bands = []
     h = gray.shape[0]
     y = 0
     while y < h:
-        if not is_white[y]:
+        if not is_bg[y]:
             y += 1
             continue
         start = y
-        while y < h and is_white[y]:
+        while y < h and is_bg[y]:
             y += 1
         end = y
         if (end - start) >= min_run:
@@ -42,7 +66,7 @@ def find_white_bands(gray, x1, x2, white_thr=245, min_run=18):
 
 def pick_best_gap_between_bands(bands, h, min_gap_px, prefer_lower_half=True):
     """
-    Беремо проміжки між сусідніми білими смугами та обираємо найкращий:
+    Беремо проміжки між сусідніми фоновими смугами та обираємо найкращий:
     - gap >= min_gap_px
     - бажано в нижній половині екрану
     """
@@ -51,8 +75,8 @@ def pick_best_gap_between_bands(bands, h, min_gap_px, prefer_lower_half=True):
 
     best = None  # (score, top, bottom)
     for i in range(len(bands) - 1):
-        top = bands[i][1]      # кінець верхньої білої смуги
-        bottom = bands[i+1][0] # початок нижньої білої смуги
+        top = bands[i][1]       # кінець верхньої фонової смуги
+        bottom = bands[i + 1][0]  # початок нижньої фонової смуги
         gap = bottom - top
         if gap < min_gap_px:
             continue
@@ -91,16 +115,25 @@ async def crop_ad(file: UploadFile = File(...)):
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2) Працюємо по центральній ширині, щоб зменшити вплив країв/іконок
-    x1 = int(0.08 * w)
-    x2 = int(0.92 * w)
+    # 2) Визначаємо тему (light/dark)
+    theme = detect_theme(gray, w, h)
 
-    # 3) Знаходимо білі поля та беремо проміжок між двома сусідніми білими полями
-    bands = find_white_bands(gray, x1, x2, white_thr=245, min_run=18)
+    # 3) Працюємо по центральній ширині, щоб зменшити вплив країв/іконок
+    x1 = int(0.15 * w)
+    x2 = int(0.85 * w)
+
+    # 4) Знаходимо фонові смуги і беремо проміжок між двома сусідніми фоновими смугами
+    bands = find_bg_bands(
+        gray, x1, x2, theme,
+        min_run=24,
+        white_thr=235, white_frac=0.985,
+        black_thr=30, black_frac=0.985
+    )
+
     gap = pick_best_gap_between_bands(
         bands,
         h,
-        min_gap_px=int(0.15 * h),  # мінімальна висота "card"
+        min_gap_px=int(0.18 * h),  # мінімальна висота "card" (картинка + текст)
         prefer_lower_half=True
     )
 
@@ -109,13 +142,13 @@ async def crop_ad(file: UploadFile = File(...)):
 
     top, bottom = gap
 
-    # 4) Padding, щоб взяти весь банер + те, що під ним належить
+    # 5) Padding
     pad_top = int(0.01 * h)
     pad_bottom = int(0.01 * h)
     top = max(0, top - pad_top)
     bottom = min(h, bottom + pad_bottom)
 
-    # 5) Не залазимо в нижній navbar
+    # 6) Не залазимо в нижній navbar (YouTube + інші апки)
     bottom = min(bottom, int(0.92 * h))
 
     crop = img[top:bottom, 0:w]
