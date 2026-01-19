@@ -15,19 +15,12 @@ def resize_to_width(img, target_w=1080):
     return cv2.resize(img, (target_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-def auto_white_threshold(gray, x1, x2):
+def find_white_bands(gray, x1, x2, white_thr=245, min_run=18):
     """
-    Адаптивний поріг "білизни" під конкретний скрін.
-    Беремо розподіл середньої яскравості рядків і ставимо поріг трохи нижче
-    верхніх значень (бо білі поля займають помітну частину екрана).
+    Повертає список білих горизонтальних смуг (start_y, end_y exclusive).
+    Білою вважаємо смугу, де середня яскравість рядка >= white_thr
+    протягом min_run рядків.
     """
-    row_mean = gray[:, x1:x2].mean(axis=1)
-    p = float(np.percentile(row_mean, 92))  # 90-95 працює стабільно
-    thr = int(np.clip(p - 5, 228, 245))     # clamp щоб не з'їхати в крайнощі
-    return thr
-
-
-def find_white_bands(gray, x1, x2, white_thr, min_run):
     row_mean = gray[:, x1:x2].mean(axis=1)
     is_white = row_mean >= white_thr
 
@@ -43,24 +36,30 @@ def find_white_bands(gray, x1, x2, white_thr, min_run):
             y += 1
         end = y
         if (end - start) >= min_run:
-            bands.append((start, end))  # end exclusive
+            bands.append((start, end))
     return bands
 
 
 def pick_best_gap_between_bands(bands, h, min_gap_px, prefer_lower_half=True):
+    """
+    Беремо проміжки між сусідніми білими смугами та обираємо найкращий:
+    - gap >= min_gap_px
+    - бажано в нижній половині екрану
+    """
     if len(bands) < 2:
         return None
 
     best = None  # (score, top, bottom)
     for i in range(len(bands) - 1):
-        top = bands[i][1]
-        bottom = bands[i + 1][0]
+        top = bands[i][1]      # кінець верхньої білої смуги
+        bottom = bands[i+1][0] # початок нижньої білої смуги
         gap = bottom - top
         if gap < min_gap_px:
             continue
 
         center = (top + bottom) / 2.0
         score = float(gap)
+
         if prefer_lower_half:
             score *= 1.2 if center >= 0.50 * h else 0.8
 
@@ -70,32 +69,6 @@ def pick_best_gap_between_bands(bands, h, min_gap_px, prefer_lower_half=True):
     if best is None:
         return None
     return (best[1], best[2])
-
-
-def first_white_band_at_or_below(bands, y):
-    for b in bands:
-        if b[0] >= y:
-            return b
-    return None
-
-
-def is_text_block(gray, y1, y2, x1, x2):
-    """
-    "Схоже на текст" (під рекламою): світлий фон + помірні edges + невисока variance.
-    Якщо це вже наступне фото — variance/edges зазвичай значно вищі.
-    """
-    if y2 <= y1:
-        return False
-
-    roi = gray[y1:y2, x1:x2]
-    mean = float(roi.mean())
-    std = float(roi.std())
-
-    edges = cv2.Canny(roi, 60, 180)
-    edge_density = float((edges > 0).mean())  # 0..1
-
-    # Текстовий блок зазвичай дуже світлий і "спокійний"
-    return (mean >= 205) and (std <= 55) and (0.0015 <= edge_density <= 0.06)
 
 
 @app.get("/health")
@@ -113,25 +86,21 @@ async def crop_ad(file: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    # Normalize
+    # 1) Normalize (різні телефони)
     img = resize_to_width(img, target_w=1080)
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # центральна ширина
+    # 2) Працюємо по центральній ширині, щоб зменшити вплив країв/іконок
     x1 = int(0.08 * w)
     x2 = int(0.92 * w)
 
-    # Адаптивний "білий" поріг + менш жорсткий min_run
-    white_thr = auto_white_threshold(gray, x1, x2)
-    min_run = max(10, int(0.006 * h))  # ~10-14 рядків залежно від висоти
-
-    bands = find_white_bands(gray, x1, x2, white_thr=white_thr, min_run=min_run)
-
+    # 3) Знаходимо білі поля та беремо проміжок між двома сусідніми білими полями
+    bands = find_white_bands(gray, x1, x2, white_thr=245, min_run=18)
     gap = pick_best_gap_between_bands(
         bands,
         h,
-        min_gap_px=int(0.15 * h),
+        min_gap_px=int(0.15 * h),  # мінімальна висота "card"
         prefer_lower_half=True
     )
 
@@ -140,30 +109,14 @@ async def crop_ad(file: UploadFile = File(...)):
 
     top, bottom = gap
 
-    # Додаємо підбанерний текст ТІЛЬКИ якщо він є і схожий на текст
-    nav_limit = int(0.92 * h)
-
-    b1 = first_white_band_at_or_below(bands, bottom)
-    if b1 is not None:
-        text_start = b1[1]
-        if text_start < nav_limit:
-            b2 = first_white_band_at_or_below(bands, text_start + 1)
-            # кандидата обмежуємо по висоті, щоб не залізти в наступне прев’ю
-            max_text_h = int(0.18 * h)
-            if b2 is not None:
-                text_end = min(b2[0], text_start + max_text_h, nav_limit)
-            else:
-                text_end = min(text_start + max_text_h, nav_limit)
-
-            if (text_end - text_start) >= int(0.03 * h):
-                if is_text_block(gray, text_start, text_end, x1, x2):
-                    bottom = text_end  # розширили вниз
-
-    # Padding + clamp
+    # 4) Padding, щоб взяти весь банер + те, що під ним належить
     pad_top = int(0.01 * h)
     pad_bottom = int(0.01 * h)
     top = max(0, top - pad_top)
-    bottom = min(nav_limit, bottom + pad_bottom)
+    bottom = min(h, bottom + pad_bottom)
+
+    # 5) Не залазимо в нижній navbar
+    bottom = min(bottom, int(0.92 * h))
 
     crop = img[top:bottom, 0:w]
 
@@ -172,3 +125,4 @@ async def crop_ad(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Failed to encode image")
 
     return Response(content=out.tobytes(), media_type="image/png")
+
