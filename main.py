@@ -17,7 +17,7 @@ def resize_to_width(img, target_w=1080):
 
 def detect_theme(gray, w, h):
     """
-    Просте визначення теми: дивимось медіану яскравості в центральній зоні зверху.
+    Оцінюємо яскравість UI-фону у верхній центральній зоні (без статусбару).
     """
     x1 = int(0.20 * w)
     x2 = int(0.80 * w)
@@ -28,25 +28,47 @@ def detect_theme(gray, w, h):
     return "light" if med >= 150.0 else "dark"
 
 
-def find_bg_bands(
+def find_bg_bands_youtube(
     gray, x1, x2, theme,
-    min_run=24,
-    white_thr=235, white_frac=0.985,
-    black_thr=30, black_frac=0.985
+    min_run=20,
+    # light thresholds
+    white_thr=235,
+    white_frac=0.990,
+    # dark thresholds
+    black_thr=35,
+    black_frac=0.990,
+    # edge thresholding (critical)
+    edge_thr=18.0,
+    edge_low_frac=0.90
 ):
     """
-    Повертає список фонових горизонтальних смуг (start_y, end_y exclusive).
-    Для light: фон = майже білий (частка пікселів >= white_thr).
-    Для dark:  фон = майже чорний (частка пікселів <= black_thr).
-    """
-    roi = gray[:, x1:x2]
+    Фонова смуга = рядки, де:
+      1) більшість пікселів близькі до фону (дуже світлі у light / дуже темні у dark)
+      2) і одночасно мало ребер (edge energy низька) -> текст/іконки відсікаються
 
+    Повертає (start_y, end_y exclusive) для кожної фонової смуги.
+    """
+    roi = gray[:, x1:x2].astype(np.uint8)
+
+    # 1) "background-like" mask per row
     if theme == "light":
-        frac = (roi >= white_thr).mean(axis=1)  # частка "дуже світлих" пікселів у рядку
-        is_bg = frac >= white_frac
+        frac_bg = (roi >= white_thr).mean(axis=1)
+        is_bg_by_color = frac_bg >= white_frac
     else:
-        frac = (roi <= black_thr).mean(axis=1)  # частка "дуже темних" пікселів у рядку
-        is_bg = frac >= black_frac
+        frac_bg = (roi <= black_thr).mean(axis=1)
+        is_bg_by_color = frac_bg >= black_frac
+
+    # 2) edge energy per row (Sobel magnitude)
+    # Use CV_32F for stable magnitudes
+    gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)  # float32
+
+    # Row is "low-edge" if most pixels have magnitude below edge_thr
+    low_edge_frac = (mag <= edge_thr).mean(axis=1)
+    is_low_edge = low_edge_frac >= edge_low_frac
+
+    is_bg = is_bg_by_color & is_low_edge
 
     bands = []
     h = gray.shape[0]
@@ -66,26 +88,23 @@ def find_bg_bands(
 
 def pick_best_gap_between_bands(bands, h, min_gap_px, prefer_lower_half=True):
     """
-    Беремо проміжки між сусідніми фоновими смугами та обираємо найкращий:
-    - gap >= min_gap_px
-    - бажано в нижній половині екрану
+    Обираємо найкращий gap між сусідніми фоновими смугами.
     """
     if len(bands) < 2:
         return None
 
     best = None  # (score, top, bottom)
     for i in range(len(bands) - 1):
-        top = bands[i][1]       # кінець верхньої фонової смуги
-        bottom = bands[i + 1][0]  # початок нижньої фонової смуги
+        top = bands[i][1]
+        bottom = bands[i + 1][0]
         gap = bottom - top
         if gap < min_gap_px:
             continue
 
         center = (top + bottom) / 2.0
         score = float(gap)
-
         if prefer_lower_half:
-            score *= 1.2 if center >= 0.50 * h else 0.8
+            score *= 1.25 if center >= 0.45 * h else 0.85
 
         if best is None or score > best[0]:
             best = (score, top, bottom)
@@ -110,30 +129,31 @@ async def crop_ad(file: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    # 1) Normalize (різні телефони)
+    # Normalize for different phones
     img = resize_to_width(img, target_w=1080)
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2) Визначаємо тему (light/dark)
     theme = detect_theme(gray, w, h)
 
-    # 3) Працюємо по центральній ширині, щоб зменшити вплив країв/іконок
-    x1 = int(0.15 * w)
-    x2 = int(0.85 * w)
+    # Central width to avoid avatar/menu columns
+    x1 = int(0.18 * w)
+    x2 = int(0.82 * w)
 
-    # 4) Знаходимо фонові смуги і беремо проміжок між двома сусідніми фоновими смугами
-    bands = find_bg_bands(
+    # Find background bands (now robust vs text)
+    bands = find_bg_bands_youtube(
         gray, x1, x2, theme,
-        min_run=24,
-        white_thr=235, white_frac=0.985,
-        black_thr=30, black_frac=0.985
+        min_run=20,
+        white_thr=235, white_frac=0.990,
+        black_thr=35, black_frac=0.990,
+        edge_thr=18.0, edge_low_frac=0.90
     )
 
+    # Pick best "card gap" (image + text)
     gap = pick_best_gap_between_bands(
         bands,
         h,
-        min_gap_px=int(0.18 * h),  # мінімальна висота "card" (картинка + текст)
+        min_gap_px=int(0.20 * h),
         prefer_lower_half=True
     )
 
@@ -142,13 +162,13 @@ async def crop_ad(file: UploadFile = File(...)):
 
     top, bottom = gap
 
-    # 5) Padding
+    # Padding
     pad_top = int(0.01 * h)
-    pad_bottom = int(0.01 * h)
+    pad_bottom = int(0.015 * h)
     top = max(0, top - pad_top)
     bottom = min(h, bottom + pad_bottom)
 
-    # 6) Не залазимо в нижній navbar (YouTube + інші апки)
+    # Avoid bottom navigation bar
     bottom = min(bottom, int(0.92 * h))
 
     crop = img[top:bottom, 0:w]
@@ -158,4 +178,3 @@ async def crop_ad(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Failed to encode image")
 
     return Response(content=out.tobytes(), media_type="image/png")
-
